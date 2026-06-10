@@ -2,7 +2,7 @@
 // SPDX-FileCopyrightText: 2023-2024 Luke Curley and contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-use std::ops;
+use std::{ops, time::{Duration, Instant}};
 
 use crate::{
     coding::{KeyValuePairs, Location, TrackNamespace},
@@ -14,6 +14,34 @@ use crate::{
 use crate::watch::State;
 
 use super::Subscriber;
+
+pub const DELIVERY_TIMEOUT_PARAM: u64 = 0x02;
+
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
+pub struct SubscribeOptions {
+    /// Optional maximum object age allowed for delivery.
+    ///
+    /// `None` means no delivery-timeout parameter is sent.
+    /// A zero duration is normalized to `None`.
+    pub delivery_timeout: Option<Duration>,
+    // Future extension points can be added here:
+	// - subscriber_priority
+	// - group_order
+	// - forward
+	// - filter / start / end range controls
+}
+
+impl SubscribeOptions {
+    pub fn delivery_timeout(mut self, timeout: Duration) -> Self {
+        self.delivery_timeout = if timeout.is_zero() { None } else { Some(timeout) };
+        self
+    }
+
+    pub fn no_delivery_timeout(mut self) -> Self {
+        self.delivery_timeout = None;
+        self
+    }
+}
 
 // TODO rename to SubscriptionInfo when used for Publishes as well?
 #[derive(Debug, Clone)]
@@ -92,7 +120,17 @@ impl Subscribe {
         mut subscriber: Subscriber,
         request_id: u64,
         track: TrackWriter,
+        options: SubscribeOptions,
     ) -> (Subscribe, SubscribeRecv) {
+        let mut params = KeyValuePairs::default();
+
+        if let Some(timeout) = options.delivery_timeout {
+            let timeout_ms = timeout.as_millis().min(u128::from(u64::MAX)) as u64;
+            if timeout_ms > 0 {
+                params.set_intvalue(DELIVERY_TIMEOUT_PARAM, timeout_ms);
+            }
+        }
+
         let subscribe_message = message::Subscribe {
             id: request_id,
             track_namespace: track.namespace.clone(),
@@ -104,7 +142,7 @@ impl Subscribe {
             filter_type: FilterType::LargestObject,
             start_location: None,
             end_group_id: None,
-            params: Default::default(),
+            params,
         };
         let info = SubscribeInfo::new_from_subscribe(&subscribe_message);
 
@@ -253,6 +291,7 @@ impl SubscribeRecv {
                     object_id: datagram.object_id.unwrap_or(0),
                     priority: datagram.publisher_priority,
                     payload: datagram.payload.unwrap_or_default(),
+                    received_at: Instant::now(),
                     extension_headers: datagram.extension_headers.unwrap_or_default(),
                 })?;
                 self.writer = Some(TrackWriterMode::Datagrams(datagrams));
@@ -264,6 +303,7 @@ impl SubscribeRecv {
                     object_id: datagram.object_id.unwrap_or(0),
                     priority: datagram.publisher_priority,
                     payload: datagram.payload.unwrap_or_default(),
+                    received_at: Instant::now(),
                     extension_headers: datagram.extension_headers.unwrap_or_default(),
                 })?;
                 self.writer = Some(TrackWriterMode::Datagrams(datagrams));

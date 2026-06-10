@@ -22,6 +22,7 @@ use crate::{
 use crate::watch::Queue;
 
 use super::{Announced, AnnouncedRecv, Reader, Session, SessionError, Subscribe, SubscribeRecv};
+use super::SubscribeOptions;
 
 // Default timeout for waiting for subscribe aliases to become available via SUBSCRIBE_OK (1 second)
 const DEFAULT_ALIAS_WAIT_TIME_MS: u64 = 1000;
@@ -123,7 +124,16 @@ impl Subscriber {
 
     /// Subscribe to a track by creating a new subscribe request to the publisher.  Block until subscription is closed.
     pub async fn subscribe(&mut self, track: serve::TrackWriter) -> Result<(), ServeError> {
-        let subscribe = self.subscribe_open(track).await?;
+        self.subscribe_with(track, SubscribeOptions::default()).await
+    }
+
+    /// Subscribe to a track using explicit options and block until the subscription is closed.
+    pub async fn subscribe_with(
+        &mut self,
+        track: serve::TrackWriter,
+        options: SubscribeOptions,
+    ) -> Result<(), ServeError> {
+        let subscribe = self.subscribe_open_with(track, options).await?;
         subscribe.closed().await
     }
 
@@ -132,8 +142,18 @@ impl Subscriber {
         &mut self,
         track: serve::TrackWriter,
     ) -> Result<Subscribe, ServeError> {
+        self.subscribe_open_with(track, SubscribeOptions::default())
+            .await
+    }
+
+    /// Subscribe to a track and wait until the publisher acknowledges it, using explicit options.
+    pub async fn subscribe_open_with(
+        &mut self,
+        track: serve::TrackWriter,
+        options: SubscribeOptions,
+    ) -> Result<Subscribe, ServeError> {
         let request_id = self.get_next_request_id();
-        let (send, recv) = Subscribe::new(self.clone(), request_id, track);
+        let (send, recv) = Subscribe::new(self.clone(), request_id, track, options);
         self.subscribes.lock().unwrap().insert(request_id, recv);
         send.ok().await?;
         Ok(send)

@@ -10,7 +10,7 @@
 //! The reader can be cloned, in which case each reader receives a copy of each object. (fanout)
 //!
 //! The stream is closed with [ServeError::Closed] when all writers or readers are dropped.
-use std::{cmp, ops::Deref, sync::Arc};
+use std::{cmp, ops::Deref, sync::Arc, time::Instant};
 
 use bytes::Bytes;
 
@@ -328,6 +328,7 @@ impl SubgroupWriter {
             object_id: self.next_object_id,
             status: ObjectStatus::NormalObject,
             size,
+            received_at: Instant::now(),
             extension_headers: extension_headers.unwrap_or_default(),
         }
         .produce();
@@ -458,6 +459,9 @@ pub struct SubgroupObject {
 
     // The size of the object.
     pub size: usize,
+
+    // Time when this object metadata became available to the local relay/publisher path.
+    pub received_at: Instant,
 
     // Object status
     pub status: ObjectStatus,

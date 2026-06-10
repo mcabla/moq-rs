@@ -2,7 +2,7 @@
 // SPDX-FileCopyrightText: 2023-2024 Luke Curley and contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-use std::{fmt, sync::Arc};
+use std::{fmt, sync::Arc, time::Instant};
 
 use crate::watch::State;
 
@@ -133,6 +133,9 @@ pub struct Datagram {
     pub object_id: u64,
     pub priority: u8,
     pub payload: bytes::Bytes,
+
+    // Time when this datagram was received by the local subscriber path.
+    pub received_at: Instant,
 
     // Extension headers (for draft-14 compliance, particularly immutable extensions)
     pub extension_headers: crate::data::ExtensionHeaders,

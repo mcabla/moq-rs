@@ -4,6 +4,7 @@
 
 use std::ops;
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use futures::stream::FuturesUnordered;
 use futures::StreamExt;
@@ -14,13 +15,16 @@ use crate::serve::{ServeError, TrackReaderMode};
 use crate::watch::State;
 use crate::{data, message, serve};
 
-use super::{Publisher, SessionError, SubscribeInfo, Writer};
+use super::{Publisher, SessionError, SubscribeInfo, Writer, DELIVERY_TIMEOUT_PARAM};
+
+const DELIVERY_TIMEOUT_RESET_CODE: u64 = 0x2;
 
 // This file defines Publisher handling of inbound Subscriptions
 
 #[derive(Debug)]
 struct SubscribedState {
     largest_location: Option<Location>,
+    effective_delivery_timeout: Option<Duration>,
     closed: Result<(), ServeError>,
 }
 
@@ -41,6 +45,7 @@ impl Default for SubscribedState {
     fn default() -> Self {
         Self {
             largest_location: None,
+            effective_delivery_timeout: None,
             closed: Ok(()),
         }
     }
@@ -70,7 +75,12 @@ impl Subscribed {
         msg: message::Subscribe,
         mlog: Option<Arc<Mutex<mlog::MlogWriter>>>,
     ) -> (Self, SubscribedRecv) {
-        let (send, recv) = State::default().split();
+        let effective_delivery_timeout = parse_delivery_timeout_param(&msg.params);
+        let (send, recv): (State<SubscribedState>, State<SubscribedState>) =
+            State::default().split();
+        if let Some(mut state) = send.lock_mut() {
+            state.effective_delivery_timeout = effective_delivery_timeout;
+        }
         let info = SubscribeInfo::new_from_subscribe(&msg);
         let send = Self {
             publisher,
@@ -114,7 +124,7 @@ impl Subscribed {
                 group_order: message::GroupOrder::Descending, // TODO: resolve correct value from publisher / subscriber prefs
                 content_exists: largest_location.is_some(),
                 largest_location,
-                params: Default::default(),
+                params: subscribe_ok_params(self.state.lock().effective_delivery_timeout),
             })
             .await;
 
@@ -198,6 +208,7 @@ impl Subscribed {
     ) -> Result<(), SessionError> {
         let mut tasks = FuturesUnordered::new();
         let mut done: Option<Result<(), ServeError>> = None;
+        let effective_delivery_timeout = self.state.lock().effective_delivery_timeout;
 
         loop {
             tokio::select! {
@@ -217,7 +228,16 @@ impl Subscribed {
                         let mlog = self.mlog.clone();
 
                         tasks.push(async move {
-                            if let Err(err) = Self::serve_subgroup(header, subgroup, publisher, state, mlog).await {
+                            if let Err(err) = Self::serve_subgroup(
+                                header,
+                                subgroup,
+                                publisher,
+                                state,
+                                effective_delivery_timeout,
+                                mlog,
+                            )
+                            .await
+                            {
                                 tracing::warn!("failed to serve subgroup: {:?}, error: {}", info, err);
                             }
                         });
@@ -237,6 +257,7 @@ impl Subscribed {
         mut subgroup_reader: serve::SubgroupReader,
         mut publisher: Publisher,
         state: State<SubscribedState>,
+        effective_delivery_timeout: Option<Duration>,
         mlog: Option<Arc<Mutex<mlog::MlogWriter>>>,
     ) -> Result<(), SessionError> {
         tracing::debug!(
@@ -246,37 +267,57 @@ impl Subscribed {
             subgroup_reader.priority
         );
 
-        let mut send_stream = publisher.open_uni().await?;
-        tracing::trace!("[PUBLISHER] serve_subgroup: opened unidirectional stream");
-
-        // TODO figure out u32 vs u64 priority
-        send_stream.set_priority(subgroup_reader.priority as i32);
-
-        let mut writer = Writer::new(send_stream);
-
-        tracing::debug!(
-            "[PUBLISHER] serve_subgroup: sending header - track_alias={}, group_id={}, subgroup_id={:?}, priority={}, header_type={:?}",
-            header.track_alias,
-            header.group_id,
-            header.subgroup_id,
-            header.publisher_priority,
-            header.header_type
-        );
-
-        writer.encode(&header).await?;
-
-        // Log subgroup header created/sent
-        if let Some(ref mlog) = mlog {
-            if let Ok(mut mlog_guard) = mlog.lock() {
-                let time = mlog_guard.elapsed_ms();
-                let stream_id = 0; // TODO: Placeholder, need actual QUIC stream ID
-                let event = mlog::subgroup_header_created(time, stream_id, &header);
-                let _ = mlog_guard.add_event(event);
-            }
-        }
+        let mut writer: Option<Writer> = None;
 
         let mut object_count = 0;
         while let Some(mut subgroup_object_reader) = subgroup_reader.next().await? {
+            if is_expired(subgroup_object_reader.received_at, effective_delivery_timeout) {
+                tracing::info!(
+                    "[PUBLISHER] serve_subgroup: delivery timeout hit for subgroup (group_id={}, subgroup_id={}) before sending object #{}",
+                    subgroup_reader.group_id,
+                    subgroup_reader.subgroup_id,
+                    object_count + 1
+                );
+
+                if writer.is_some() {
+                    return Err(delivery_timeout_reset_error());
+                }
+
+                return Ok(());
+            }
+
+            if writer.is_none() {
+                let mut send_stream = publisher.open_uni().await?;
+                tracing::trace!("[PUBLISHER] serve_subgroup: opened unidirectional stream");
+
+                // TODO figure out u32 vs u64 priority
+                send_stream.set_priority(subgroup_reader.priority as i32);
+
+                let mut stream_writer = Writer::new(send_stream);
+
+                tracing::debug!(
+                    "[PUBLISHER] serve_subgroup: sending header - track_alias={}, group_id={}, subgroup_id={:?}, priority={}, header_type={:?}",
+                    header.track_alias,
+                    header.group_id,
+                    header.subgroup_id,
+                    header.publisher_priority,
+                    header.header_type
+                );
+
+                stream_writer.encode(&header).await?;
+
+                if let Some(ref mlog) = mlog {
+                    if let Ok(mut mlog_guard) = mlog.lock() {
+                        let time = mlog_guard.elapsed_ms();
+                        let stream_id = 0; // TODO: Placeholder, need actual QUIC stream ID
+                        let event = mlog::subgroup_header_created(time, stream_id, &header);
+                        let _ = mlog_guard.add_event(event);
+                    }
+                }
+
+                writer = Some(stream_writer);
+            }
+
             let subgroup_object = data::SubgroupObjectExt {
                 object_id_delta: 0, // before delta logic, used to be subgroup_object_reader.object_id,
                 extension_headers: subgroup_object_reader.extension_headers.clone(), // Pass through extension headers
@@ -299,7 +340,11 @@ impl Subscribed {
                 subgroup_object.extension_headers
             );
 
-            writer.encode(&subgroup_object).await?;
+            writer
+                .as_mut()
+                .expect("writer must exist after lazy stream creation")
+                .encode(&subgroup_object)
+                .await?;
 
             // Log subgroup object created/sent
             if let Some(ref mlog) = mlog {
@@ -329,6 +374,16 @@ impl Subscribed {
             let mut chunks_sent = 0;
             let mut bytes_sent = 0;
             while let Some(chunk) = subgroup_object_reader.read().await? {
+                if is_expired(subgroup_object_reader.received_at, effective_delivery_timeout) {
+                    tracing::info!(
+                        "[PUBLISHER] serve_subgroup: delivery timeout hit mid-object (group_id={}, subgroup_id={}, object_id={})",
+                        subgroup_reader.group_id,
+                        subgroup_reader.subgroup_id,
+                        subgroup_object_reader.object_id
+                    );
+                    return Err(delivery_timeout_reset_error());
+                }
+
                 tracing::trace!(
                     "[PUBLISHER] serve_subgroup: sending payload chunk #{} for object #{} ({} bytes)",
                     chunks_sent + 1,
@@ -336,7 +391,11 @@ impl Subscribed {
                     chunk.len()
                 );
                 bytes_sent += chunk.len();
-                writer.write(&chunk).await?;
+                writer
+                    .as_mut()
+                    .expect("writer must exist while sending payload")
+                    .write(&chunk)
+                    .await?;
                 chunks_sent += 1;
             }
 
@@ -364,9 +423,19 @@ impl Subscribed {
         mut datagrams: serve::DatagramsReader,
     ) -> Result<(), SessionError> {
         tracing::debug!("[PUBLISHER] serve_datagrams: starting");
+        let effective_delivery_timeout = self.state.lock().effective_delivery_timeout;
 
         let mut datagram_count = 0;
         while let Some(datagram) = datagrams.read().await? {
+            if is_expired(datagram.received_at, effective_delivery_timeout) {
+                tracing::debug!(
+                    "[PUBLISHER] serve_datagrams: dropping expired datagram group_id={} object_id={}",
+                    datagram.group_id,
+                    datagram.object_id
+                );
+                continue;
+            }
+
             // Determine datagram type based on extension headers presence
             let has_extension_headers = !datagram.extension_headers.is_empty();
             let datagram_type = if has_extension_headers {
@@ -459,5 +528,101 @@ impl SubscribedRecv {
         }
 
         Ok(())
+    }
+}
+
+fn parse_delivery_timeout_param(params: &crate::coding::KeyValuePairs) -> Option<Duration> {
+    let kvp = params.get(DELIVERY_TIMEOUT_PARAM)?;
+    let crate::coding::Value::IntValue(timeout_ms) = &kvp.value else {
+        tracing::warn!("ignoring non-integer DELIVERY_TIMEOUT parameter");
+        return None;
+    };
+
+    if *timeout_ms == 0 {
+        return None;
+    }
+
+    Some(Duration::from_millis(*timeout_ms))
+}
+
+fn subscribe_ok_params(effective_delivery_timeout: Option<Duration>) -> crate::coding::KeyValuePairs {
+    let mut params = crate::coding::KeyValuePairs::default();
+    if let Some(timeout) = effective_delivery_timeout {
+        let timeout_ms = timeout.as_millis().min(u128::from(u64::MAX)) as u64;
+        if timeout_ms > 0 {
+            params.set_intvalue(DELIVERY_TIMEOUT_PARAM, timeout_ms);
+        }
+    }
+    params
+}
+
+fn delivery_timeout_reset_error() -> SessionError {
+    SessionError::Serve(ServeError::Closed(DELIVERY_TIMEOUT_RESET_CODE))
+}
+
+fn is_expired(received_at: Instant, effective_delivery_timeout: Option<Duration>) -> bool {
+    let Some(timeout) = effective_delivery_timeout else {
+        return false;
+    };
+
+    received_at.elapsed() >= timeout
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::coding::KeyValuePairs;
+
+    #[test]
+    fn parse_delivery_timeout_param_int_value() {
+        let mut params = KeyValuePairs::default();
+        params.set_intvalue(DELIVERY_TIMEOUT_PARAM, 1234);
+
+        assert_eq!(
+            parse_delivery_timeout_param(&params),
+            Some(Duration::from_millis(1234))
+        );
+    }
+
+    #[test]
+    fn parse_delivery_timeout_param_zero_is_none() {
+        let mut params = KeyValuePairs::default();
+        params.set_intvalue(DELIVERY_TIMEOUT_PARAM, 0);
+
+        assert_eq!(parse_delivery_timeout_param(&params), None);
+    }
+
+    #[test]
+    fn parse_delivery_timeout_param_non_integer_is_none() {
+        let mut params = KeyValuePairs::default();
+        params.set_bytesvalue(DELIVERY_TIMEOUT_PARAM, vec![1, 2, 3]);
+
+        assert_eq!(parse_delivery_timeout_param(&params), None);
+    }
+
+    #[test]
+    fn subscribe_ok_params_roundtrip_timeout() {
+        let params = subscribe_ok_params(Some(Duration::from_millis(2500)));
+        let parsed = parse_delivery_timeout_param(&params);
+
+        assert_eq!(parsed, Some(Duration::from_millis(2500)));
+    }
+
+    #[test]
+    fn is_expired_respects_timeout() {
+        let old = Instant::now() - Duration::from_millis(20);
+        let recent = Instant::now();
+
+        assert!(is_expired(old, Some(Duration::from_millis(10))));
+        assert!(!is_expired(recent, Some(Duration::from_secs(1))));
+        assert!(!is_expired(old, None));
+    }
+
+    #[test]
+    fn mid_object_timeout_maps_to_delivery_timeout_reset_code() {
+        assert!(matches!(
+            delivery_timeout_reset_error(),
+            SessionError::Serve(ServeError::Closed(DELIVERY_TIMEOUT_RESET_CODE))
+        ));
     }
 }
