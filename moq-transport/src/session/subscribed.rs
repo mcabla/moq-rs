@@ -108,10 +108,11 @@ impl Subscribed {
     async fn serve_inner(&mut self, track: serve::TrackReader) -> Result<(), SessionError> {
         // Update largest location before sending SubscribeOk
         let largest_location = track.largest_location();
-        self.state
-            .lock_mut()
-            .ok_or(ServeError::Cancel)?
-            .largest_location = largest_location;
+        let effective_delivery_timeout = {
+            let mut state = self.state.lock_mut().ok_or(ServeError::Cancel)?;
+            state.largest_location = largest_location;
+            state.effective_delivery_timeout
+        };
 
         // Send SubscribeOk using send_message_and_wait to ensure it is sent at least to the QUIC stack before
         // we start serving the track.  If a subscriber gets the stream before SubscribeOk
@@ -124,7 +125,7 @@ impl Subscribed {
                 group_order: message::GroupOrder::Descending, // TODO: resolve correct value from publisher / subscriber prefs
                 content_exists: largest_location.is_some(),
                 largest_location,
-                params: subscribe_ok_params(self.state.lock().effective_delivery_timeout),
+                params: subscribe_ok_params(effective_delivery_timeout),
             })
             .await;
 
